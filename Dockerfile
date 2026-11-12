@@ -1,7 +1,12 @@
 FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
-    DEBIAN_FRONTEND=noninteractive
+    DEBIAN_FRONTEND=noninteractive \
+    PORT=8000 \
+    DOMAIN="" \
+    ALEXA_SKILL_ID="" \
+    STREAM_SECRET="" \
+    VERIFY_ALEXA_SIGNATURE=true
 
 WORKDIR /app
 
@@ -16,5 +21,6 @@ COPY app.py .
 
 EXPOSE 8000
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"]
+
 

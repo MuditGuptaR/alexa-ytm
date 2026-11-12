@@ -1,5 +1,6 @@
 import os
 import time
+import secrets
 import hmac
 import hashlib
 import logging
@@ -22,11 +23,28 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("alexa-ytm")
 
-DOMAIN = os.getenv("DOMAIN", "localhost")
-STREAM_SECRET = os.getenv("STREAM_SECRET", "change-me-to-a-secure-random-token-32-chars")
-ALEXA_SKILL_ID = os.getenv("ALEXA_SKILL_ID", "")
+# Environment variables with smart auto-detection
+DOMAIN = os.getenv("DOMAIN", "").strip()
+STREAM_SECRET = os.getenv("STREAM_SECRET", "").strip()
+if not STREAM_SECRET:
+    STREAM_SECRET = secrets.token_hex(16)
+    logger.info("STREAM_SECRET was empty: automatically generated a secure random 32-char secret.")
+
+ALEXA_SKILL_ID = os.getenv("ALEXA_SKILL_ID", "").strip()
 VERIFY_ALEXA_SIGNATURE = os.getenv("VERIFY_ALEXA_SIGNATURE", "true").lower() == "true"
 COOKIE_FILE = os.getenv("COOKIE_FILE", "browser.json")
+
+def resolve_domain(request: Request) -> str:
+    """Uses configured DOMAIN or auto-detects from request headers."""
+    if DOMAIN:
+        return DOMAIN
+    forwarded = request.headers.get("x-forwarded-host")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    host = request.headers.get("host")
+    if host:
+        return host.strip()
+    return "localhost"
 
 # Initialize YTMusic
 if os.path.exists(COOKIE_FILE):
@@ -129,9 +147,9 @@ async def verify_alexa_request(request: Request, raw_body: bytes) -> bool:
         return False
 
 
-def build_audio_directive(play_behavior: str, video_id: str, title: str, artist: str, thumb_url: str, prev_token: Optional[str] = None):
+def build_audio_directive(domain: str, play_behavior: str, video_id: str, title: str, artist: str, thumb_url: str, prev_token: Optional[str] = None):
     sec = generate_stream_token(video_id)
-    stream_url = f"https://{DOMAIN}/stream/{video_id}?t={sec['token']}&exp={sec['exp']}"
+    stream_url = f"https://{domain}/stream/{video_id}?t={sec['token']}&exp={sec['exp']}"
 
     stream_obj = {
         "url": stream_url,
@@ -195,6 +213,7 @@ def get_radio_next(video_id: str):
 
 @app.post("/alexa")
 async def alexa_skill_handler(request: Request):
+    domain = resolve_domain(request)
     raw_body = await request.body()
 
     if not await verify_alexa_request(request, raw_body):
@@ -253,7 +272,7 @@ async def alexa_skill_handler(request: Request):
                     }
                 }
 
-            directive = build_audio_directive("REPLACE_ALL", track["videoId"], track["title"], track["artist"], track["thumb"])
+            directive = build_audio_directive(domain, "REPLACE_ALL", track["videoId"], track["title"], track["artist"], track["thumb"])
             return {
                 "version": "1.0",
                 "response": {
@@ -281,7 +300,7 @@ async def alexa_skill_handler(request: Request):
                 thumbs = first.get("thumbnails", [])
                 thumb_url = thumbs[-1]["url"] if thumbs else ""
 
-                directive = build_audio_directive("REPLACE_ALL", vid, title, artists, thumb_url)
+                directive = build_audio_directive(domain, "REPLACE_ALL", vid, title, artists, thumb_url)
                 return {
                     "version": "1.0",
                     "response": {
@@ -315,7 +334,7 @@ async def alexa_skill_handler(request: Request):
             offset = ap_ctx.get("offsetInMilliseconds", 0)
             if token:
                 sec = generate_stream_token(token)
-                stream_url = f"https://{DOMAIN}/stream/{token}?t={sec['token']}&exp={sec['exp']}"
+                stream_url = f"https://{domain}/stream/{token}?t={sec['token']}&exp={sec['exp']}"
                 directive = {
                     "type": "AudioPlayer.Play",
                     "playBehavior": "REPLACE_ALL",
@@ -335,7 +354,7 @@ async def alexa_skill_handler(request: Request):
             if token:
                 nxt = get_radio_next(token)
                 if nxt:
-                    directive = build_audio_directive("REPLACE_ALL", nxt["videoId"], nxt["title"], nxt["artist"], nxt["thumb"])
+                    directive = build_audio_directive(domain, "REPLACE_ALL", nxt["videoId"], nxt["title"], nxt["artist"], nxt["thumb"])
                     return {
                         "version": "1.0",
                         "response": {
@@ -349,7 +368,7 @@ async def alexa_skill_handler(request: Request):
             token = data.get("context", {}).get("AudioPlayer", {}).get("token")
             if token:
                 sec = generate_stream_token(token)
-                stream_url = f"https://{DOMAIN}/stream/{token}?t={sec['token']}&exp={sec['exp']}"
+                stream_url = f"https://{domain}/stream/{token}?t={sec['token']}&exp={sec['exp']}"
                 directive = {
                     "type": "AudioPlayer.Play",
                     "playBehavior": "REPLACE_ALL",
@@ -383,6 +402,7 @@ async def alexa_skill_handler(request: Request):
             nxt = get_radio_next(current_token)
             if nxt:
                 directive = build_audio_directive(
+                    domain,
                     "ENQUEUE",
                     nxt["videoId"],
                     nxt["title"],
