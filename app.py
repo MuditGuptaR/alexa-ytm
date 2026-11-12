@@ -512,28 +512,50 @@ async def proxy_audio_stream(video_id: str, t: str, exp: str, request: Request):
     if not verify_stream_token(video_id, t, exp):
         raise HTTPException(status_code=403, detail="Forbidden: Invalid or expired audio token")
 
-    # Extract direct audio URL via yt-dlp using Android/iOS client to bypass datacenter IP restrictions
-    ydl_opts = {
-        "format": "140/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best",
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "ios", "mweb"]
-            }
-        },
-    }
+    audio_url = None
 
+    # 1. First attempt: resolve via ytmusicapi get_song (uses internal mobile endpoint, no datacenter block)
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-            audio_url = info.get("url")
-            if not audio_url:
-                raise HTTPException(status_code=404, detail="Audio stream not found")
+        logger.info(f"Resolving audio stream for {video_id} via ytmusicapi")
+        song_data = yt.get_song(video_id)
+        streaming_data = song_data.get("streamingData", {})
+        formats = streaming_data.get("adaptiveFormats", [])
+        for f in formats:
+            if "audio/mp4" in f.get("mimeType", "") and f.get("url"):
+                audio_url = f.get("url")
+                logger.info(f"Resolved direct audio/mp4 stream from ytmusicapi for {video_id}")
+                break
+        if not audio_url:
+            for f in formats:
+                if "audio" in f.get("mimeType", "") and f.get("url"):
+                    audio_url = f.get("url")
+                    logger.info(f"Resolved fallback audio stream from ytmusicapi for {video_id}")
+                    break
     except Exception as e:
-        logger.error(f"yt-dlp resolution error for {video_id}: {traceback.format_exc()}")
-        raise HTTPException(status_code=502, detail=f"Failed to resolve audio stream: {e}")
+        logger.warning(f"ytmusicapi get_song failed for {video_id}: {e}")
+
+    # 2. Fallback to yt-dlp if direct URL was not available
+    if not audio_url:
+        ydl_opts = {
+            "format": "140/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best",
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android", "ios", "mweb"]
+                }
+            },
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+                audio_url = info.get("url")
+        except Exception as e:
+            logger.error(f"yt-dlp resolution error for {video_id}: {traceback.format_exc()}")
+
+    if not audio_url:
+        raise HTTPException(status_code=404, detail="Audio stream not found")
 
     # Forward range header from Alexa
     client = httpx.AsyncClient(follow_redirects=True, timeout=30.0)
