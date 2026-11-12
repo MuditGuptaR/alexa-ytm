@@ -4,6 +4,7 @@ import secrets
 import re
 import hmac
 import hashlib
+from urllib.parse import quote
 import logging
 from typing import Optional, Dict, Any
 from urllib.parse import urlparse
@@ -36,6 +37,7 @@ ALEXA_SKILL_ID = os.getenv("ALEXA_SKILL_ID", "amzn1.ask.skill.7848da1c-e2dc-4113
 # Behind Cloudflare Tunnel, Skill ID authorization is standard and prevents signature breakage
 VERIFY_ALEXA_SIGNATURE = os.getenv("VERIFY_ALEXA_SIGNATURE", "false").lower() == "true"
 COOKIE_FILE = os.getenv("COOKIE_FILE", "browser.json")
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
 def resolve_domain(request: Request) -> str:
     """Uses configured DOMAIN or auto-detects from request headers."""
@@ -215,9 +217,30 @@ def build_audio_directive(domain: str, play_behavior: str, video_id: str, title:
 
 
 def search_track(query: str):
-    """Search for a track on YouTube Music and extract metadata."""
+    """Search for a track using YouTube Data API if key provided, else ytmusicapi."""
     clean_q = clean_query(query)
     logger.info(f"Searching YouTube Music for: '{clean_q}' (raw query: '{query}')")
+
+    if YOUTUBE_API_KEY:
+        try:
+            logger.info("Using official YouTube Data API v3 for search")
+            url = f"https://www.googleapis.com/youtube/v3/search?part=snippet&q={quote(clean_q)}&type=video&maxResults=1&key={YOUTUBE_API_KEY}"
+            resp = httpx.get(url, timeout=5.0)
+            if resp.status_code == 200:
+                items = resp.json().get("items", [])
+                if items:
+                    item = items[0]
+                    vid = item.get("id", {}).get("videoId")
+                    snippet = item.get("snippet", {})
+                    title = snippet.get("title", "Unknown Track")
+                    artist = snippet.get("channelTitle", "YouTube")
+                    thumb_url = snippet.get("thumbnails", {}).get("high", {}).get("url", "")
+                    if vid:
+                        logger.info(f"Official API found track: '{title}' by '{artist}' (ID: {vid})")
+                        return {"videoId": vid, "title": title, "artist": artist, "thumb": thumb_url}
+        except Exception as e:
+            logger.warning(f"YouTube Data API error: {e}; falling back to internal search")
+
     results = yt.search(clean_q, filter="songs")
     if not results:
         results = yt.search(clean_q)
