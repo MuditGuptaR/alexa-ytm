@@ -1,0 +1,465 @@
+import os
+import time
+import hmac
+import hashlib
+import logging
+from typing import Optional, Dict, Any
+from urllib.parse import urlparse
+import base64
+
+import httpx
+from fastapi import FastAPI, Request, HTTPException, Response, status
+from fastapi.responses import StreamingResponse
+from dotenv import load_dotenv
+from ytmusicapi import YTMusic
+import yt_dlp
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding
+
+load_dotenv()
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("alexa-ytm")
+
+DOMAIN = os.getenv("DOMAIN", "localhost")
+STREAM_SECRET = os.getenv("STREAM_SECRET", "change-me-to-a-secure-random-token-32-chars")
+ALEXA_SKILL_ID = os.getenv("ALEXA_SKILL_ID", "")
+VERIFY_ALEXA_SIGNATURE = os.getenv("VERIFY_ALEXA_SIGNATURE", "true").lower() == "true"
+COOKIE_FILE = os.getenv("COOKIE_FILE", "browser.json")
+
+# Initialize YTMusic
+if os.path.exists(COOKIE_FILE):
+    logger.info(f"Loading authenticated YouTube Music session from {COOKIE_FILE}")
+    yt = YTMusic(COOKIE_FILE)
+else:
+    logger.info("Initializing public/unauthenticated YouTube Music client")
+    yt = YTMusic()
+
+app = FastAPI(title="Alexa YouTube Music Bridge", docs_url=None, redoc_url=None)
+
+# Cache for Amazon certs
+CERT_CACHE: Dict[str, x509.Certificate] = {}
+
+
+def generate_stream_token(video_id: str, duration_sec: int = 14400) -> Dict[str, str]:
+    """Generates an HMAC token valid for 4 hours."""
+    exp = str(int(time.time()) + duration_sec)
+    signature = hmac.new(
+        STREAM_SECRET.encode("utf-8"),
+        f"{video_id}:{exp}".encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+    return {"token": signature, "exp": exp}
+
+
+def verify_stream_token(video_id: str, token: str, exp: str) -> bool:
+    """Verifies HMAC signature and expiration."""
+    try:
+        if int(exp) < time.time():
+            return False
+        expected = hmac.new(
+            STREAM_SECRET.encode("utf-8"),
+            f"{video_id}:{exp}".encode("utf-8"),
+            hashlib.sha256
+        ).hexdigest()
+        return hmac.compare_digest(expected, token)
+    except Exception:
+        return False
+
+
+async def verify_alexa_request(request: Request, raw_body: bytes) -> bool:
+    """Verifies Alexa signature according to Amazon specifications."""
+    if not VERIFY_ALEXA_SIGNATURE:
+        return True
+
+    cert_url = request.headers.get("SignatureCertChainUrl", "")
+    signature = request.headers.get("Signature", "")
+
+    if not cert_url or not signature:
+        logger.warning("Missing Alexa signature headers")
+        return False
+
+    # Validate cert URL
+    parsed_url = urlparse(cert_url)
+    if parsed_url.scheme.lower() != "https":
+        return False
+    if parsed_url.hostname.lower() != "s3.amazonaws.com":
+        return False
+    if not parsed_url.path.startswith("/echo.api/"):
+        return False
+    if parsed_url.port and parsed_url.port != 443:
+        return False
+
+    try:
+        # Fetch or get cached cert
+        if cert_url in CERT_CACHE:
+            cert = CERT_CACHE[cert_url]
+        else:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                res = await client.get(cert_url)
+                if res.status_code != 200:
+                    return False
+                cert = x509.load_pem_x509_certificate(res.content)
+                CERT_CACHE[cert_url] = cert
+
+        # Verify cert validity period
+        now = time.time()
+        if now < cert.not_valid_before.timestamp() or now > cert.not_valid_after.timestamp():
+            return False
+
+        # Verify Subject Alternative Name contains echo.api.amazon.com
+        san_ext = cert.extensions.get_extension_for_oid(x509.oid.ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
+        dns_names = san_ext.value.get_values_for_type(x509.DNSName)
+        if "echo.api.amazon.com" not in dns_names:
+            return False
+
+        # Verify signature
+        public_key = cert.public_key()
+        sig_bytes = base64.b64decode(signature)
+        public_key.verify(
+            sig_bytes,
+            raw_body,
+            padding.PKCS1v15(),
+            hashes.SHA1()
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"Signature verification failed: {e}")
+        return False
+
+
+def build_audio_directive(play_behavior: str, video_id: str, title: str, artist: str, thumb_url: str, prev_token: Optional[str] = None):
+    sec = generate_stream_token(video_id)
+    stream_url = f"https://{DOMAIN}/stream/{video_id}?t={sec['token']}&exp={sec['exp']}"
+
+    stream_obj = {
+        "url": stream_url,
+        "token": video_id,
+        "offsetInMilliseconds": 0
+    }
+    if prev_token:
+        stream_obj["expectedPreviousToken"] = prev_token
+
+    return {
+        "type": "AudioPlayer.Play",
+        "playBehavior": play_behavior,
+        "audioItem": {
+            "stream": stream_obj,
+            "metadata": {
+                "title": title,
+                "subtitle": artist,
+                "art": {
+                    "sources": [{"url": thumb_url}] if thumb_url else []
+                }
+            }
+        }
+    }
+
+
+def search_track(query: str):
+    """Search for a track on YouTube Music and extract metadata."""
+    results = yt.search(query, filter="songs")
+    if not results:
+        results = yt.search(query)
+    
+    for r in results:
+        # Look for a playable item with a videoId
+        vid = r.get("videoId")
+        if vid:
+            title = r.get("title", "Unknown Track")
+            artists = ", ".join([a.get("name", "") for a in r.get("artists", [])]) or "YouTube Music"
+            thumbs = r.get("thumbnails", [])
+            thumb_url = thumbs[-1]["url"] if thumbs else ""
+            return {"videoId": vid, "title": title, "artist": artists, "thumb": thumb_url}
+    return None
+
+
+def get_radio_next(video_id: str):
+    """Get the next recommended song in the radio queue."""
+    try:
+        watch = yt.get_watch_playlist(videoId=video_id, limit=5)
+        tracks = watch.get("tracks", [])
+        for t in tracks:
+            vid = t.get("videoId")
+            if vid and vid != video_id:
+                title = t.get("title", "Next Track")
+                artists = ", ".join([a.get("name", "") for a in t.get("artists", [])]) or "YouTube Music"
+                thumbs = t.get("thumbnail", [])
+                thumb_url = thumbs[-1]["url"] if thumbs else ""
+                return {"videoId": vid, "title": title, "artist": artists, "thumb": thumb_url}
+    except Exception as e:
+        logger.error(f"Error fetching watch playlist: {e}")
+    return None
+
+
+@app.post("/alexa")
+async def alexa_skill_handler(request: Request):
+    raw_body = await request.body()
+
+    if not await verify_alexa_request(request, raw_body):
+        raise HTTPException(status_code=400, detail="Invalid request signature")
+
+    data = await request.json()
+
+    # Validate Skill ID if set
+    app_id = (
+        data.get("session", {}).get("application", {}).get("applicationId")
+        or data.get("context", {}).get("System", {}).get("application", {}).get("applicationId")
+    )
+    if ALEXA_SKILL_ID and app_id != ALEXA_SKILL_ID:
+        logger.warning(f"Skill ID mismatch: got '{app_id}', expected '{ALEXA_SKILL_ID}'")
+        raise HTTPException(status_code=403, detail="Skill ID mismatch")
+
+    req = data.get("request", {})
+    req_type = req.get("type")
+
+    # 1. LaunchRequest
+    if req_type == "LaunchRequest":
+        return {
+            "version": "1.0",
+            "response": {
+                "outputSpeech": {
+                    "type": "PlainText",
+                    "text": "YouTube Music is ready. What would you like to hear?"
+                },
+                "shouldEndSession": False
+            }
+        }
+
+    # 2. IntentRequest
+    if req_type == "IntentRequest":
+        intent = req.get("intent", {})
+        intent_name = intent.get("name")
+
+        if intent_name in ("PlayMusicIntent", "SearchIntent"):
+            query_slot = intent.get("slots", {}).get("query", {}).get("value")
+            if not query_slot:
+                return {
+                    "version": "1.0",
+                    "response": {
+                        "outputSpeech": {"type": "PlainText", "text": "What song or artist do you want to play?"},
+                        "shouldEndSession": False
+                    }
+                }
+
+            track = search_track(query_slot)
+            if not track:
+                return {
+                    "version": "1.0",
+                    "response": {
+                        "outputSpeech": {"type": "PlainText", "text": f"Sorry, I couldn't find {query_slot} on YouTube Music."},
+                        "shouldEndSession": True
+                    }
+                }
+
+            directive = build_audio_directive("REPLACE_ALL", track["videoId"], track["title"], track["artist"], track["thumb"])
+            return {
+                "version": "1.0",
+                "response": {
+                    "outputSpeech": {
+                        "type": "PlainText",
+                        "text": f"Playing {track['title']} by {track['artist']}"
+                    },
+                    "directives": [directive],
+                    "shouldEndSession": True
+                }
+            }
+
+        elif intent_name == "PlayLikedSongsIntent":
+            try:
+                liked = yt.get_liked_songs(limit=25)
+                tracks = liked.get("tracks", [])
+                if not tracks:
+                    msg = "No liked songs found or cookie file is not configured."
+                    return {"version": "1.0", "response": {"outputSpeech": {"type": "PlainText", "text": msg}, "shouldEndSession": True}}
+
+                first = tracks[0]
+                vid = first.get("videoId")
+                title = first.get("title", "Liked Songs")
+                artists = ", ".join([a.get("name", "") for a in first.get("artists", [])]) or "YouTube Music"
+                thumbs = first.get("thumbnails", [])
+                thumb_url = thumbs[-1]["url"] if thumbs else ""
+
+                directive = build_audio_directive("REPLACE_ALL", vid, title, artists, thumb_url)
+                return {
+                    "version": "1.0",
+                    "response": {
+                        "outputSpeech": {"type": "PlainText", "text": "Playing your liked songs on YouTube Music."},
+                        "directives": [directive],
+                        "shouldEndSession": True
+                    }
+                }
+            except Exception as e:
+                logger.error(f"Error fetching liked songs: {e}")
+                return {
+                    "version": "1.0",
+                    "response": {
+                        "outputSpeech": {"type": "PlainText", "text": "Could not access liked songs. Make sure browser.json is set up."},
+                        "shouldEndSession": True
+                    }
+                }
+
+        elif intent_name in ("AMAZON.PauseIntent", "AMAZON.StopIntent", "AMAZON.CancelIntent"):
+            return {
+                "version": "1.0",
+                "response": {
+                    "directives": [{"type": "AudioPlayer.Stop"}],
+                    "shouldEndSession": True
+                }
+            }
+
+        elif intent_name == "AMAZON.ResumeIntent":
+            ap_ctx = data.get("context", {}).get("AudioPlayer", {})
+            token = ap_ctx.get("token")
+            offset = ap_ctx.get("offsetInMilliseconds", 0)
+            if token:
+                sec = generate_stream_token(token)
+                stream_url = f"https://{DOMAIN}/stream/{token}?t={sec['token']}&exp={sec['exp']}"
+                directive = {
+                    "type": "AudioPlayer.Play",
+                    "playBehavior": "REPLACE_ALL",
+                    "audioItem": {
+                        "stream": {
+                            "url": stream_url,
+                            "token": token,
+                            "offsetInMilliseconds": offset
+                        }
+                    }
+                }
+                return {"version": "1.0", "response": {"directives": [directive], "shouldEndSession": True}}
+            return {"version": "1.0", "response": {"shouldEndSession": True}}
+
+        elif intent_name == "AMAZON.NextIntent":
+            token = data.get("context", {}).get("AudioPlayer", {}).get("token")
+            if token:
+                nxt = get_radio_next(token)
+                if nxt:
+                    directive = build_audio_directive("REPLACE_ALL", nxt["videoId"], nxt["title"], nxt["artist"], nxt["thumb"])
+                    return {
+                        "version": "1.0",
+                        "response": {
+                            "directives": [directive],
+                            "shouldEndSession": True
+                        }
+                    }
+            return {"version": "1.0", "response": {"directives": [{"type": "AudioPlayer.Stop"}], "shouldEndSession": True}}
+
+        elif intent_name == "AMAZON.PreviousIntent":
+            token = data.get("context", {}).get("AudioPlayer", {}).get("token")
+            if token:
+                sec = generate_stream_token(token)
+                stream_url = f"https://{DOMAIN}/stream/{token}?t={sec['token']}&exp={sec['exp']}"
+                directive = {
+                    "type": "AudioPlayer.Play",
+                    "playBehavior": "REPLACE_ALL",
+                    "audioItem": {
+                        "stream": {
+                            "url": stream_url,
+                            "token": token,
+                            "offsetInMilliseconds": 0
+                        }
+                    }
+                }
+                return {"version": "1.0", "response": {"directives": [directive], "shouldEndSession": True}}
+            return {"version": "1.0", "response": {"shouldEndSession": True}}
+
+        elif intent_name in ("AMAZON.HelpIntent",):
+            return {
+                "version": "1.0",
+                "response": {
+                    "outputSpeech": {
+                        "type": "PlainText",
+                        "text": "You can say: play Bohemian Rhapsody, or play my liked songs."
+                    },
+                    "shouldEndSession": False
+                }
+            }
+
+    # 3. AudioPlayer.PlaybackNearlyFinished -> Autoplay next track!
+    if req_type == "AudioPlayer.PlaybackNearlyFinished":
+        current_token = req.get("token")
+        if current_token:
+            nxt = get_radio_next(current_token)
+            if nxt:
+                directive = build_audio_directive(
+                    "ENQUEUE",
+                    nxt["videoId"],
+                    nxt["title"],
+                    nxt["artist"],
+                    nxt["thumb"],
+                    prev_token=current_token
+                )
+                return {
+                    "version": "1.0",
+                    "response": {
+                        "directives": [directive]
+                    }
+                }
+
+    # Default empty 200 response for lifecycle events (PlaybackStarted, PlaybackStopped, PlaybackFinished, SessionEndedRequest)
+    return {"version": "1.0", "response": {}}
+
+
+@app.get("/stream/{video_id}")
+async def proxy_audio_stream(video_id: str, t: str, exp: str, request: Request):
+    """Securely proxies YouTube audio stream directly to Alexa with range support."""
+    if not verify_stream_token(video_id, t, exp):
+        raise HTTPException(status_code=403, detail="Forbidden: Invalid or expired audio token")
+
+    # Extract direct audio URL via yt-dlp
+    ydl_opts = {
+        "format": "140/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best",
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+            audio_url = info.get("url")
+            if not audio_url:
+                raise HTTPException(status_code=404, detail="Audio stream not found")
+    except Exception as e:
+        logger.error(f"yt-dlp resolution error for {video_id}: {e}")
+        raise HTTPException(status_code=502, detail="Failed to resolve audio stream")
+
+    # Forward range header from Alexa
+    client = httpx.AsyncClient(follow_redirects=True, timeout=30.0)
+    req_headers = {}
+    range_header = request.headers.get("Range")
+    if range_header:
+        req_headers["Range"] = range_header
+
+    upstream_req = client.build_request("GET", audio_url, headers=req_headers)
+    upstream_resp = await client.send(upstream_req, stream=True)
+
+    resp_headers = {
+        "Content-Type": upstream_resp.headers.get("Content-Type", "audio/mp4"),
+        "Accept-Ranges": "bytes",
+    }
+    if "Content-Length" in upstream_resp.headers:
+        resp_headers["Content-Length"] = upstream_resp.headers["Content-Length"]
+    if "Content-Range" in upstream_resp.headers:
+        resp_headers["Content-Range"] = upstream_resp.headers["Content-Range"]
+
+    async def stream_generator():
+        try:
+            async for chunk in upstream_resp.aiter_bytes():
+                yield chunk
+        finally:
+            await upstream_resp.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        stream_generator(),
+        status_code=upstream_resp.status_code,
+        headers=resp_headers
+    )
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "service": "alexa-ytm"}
+

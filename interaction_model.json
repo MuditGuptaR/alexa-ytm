@@ -1,0 +1,69 @@
+{
+  "interactionModel": {
+    "languageModel": {
+      "invocationName": "youtube music",
+      "intents": [
+        {
+          "name": "PlayMusicIntent",
+          "slots": [
+            {
+              "name": "query",
+              "type": "AMAZON.SearchQuery"
+            }
+          ],
+          "samples": [
+            "play {query}",
+            "play song {query}",
+            "play the song {query}",
+            "play music {query}",
+            "play track {query}",
+            "start playing {query}",
+            "search and play {query}",
+            "play {query} on youtube music"
+          ]
+        },
+        {
+          "name": "PlayLikedSongsIntent",
+          "slots": [],
+          "samples": [
+            "play my liked songs",
+            "play liked songs",
+            "play my favorites",
+            "play favorite songs",
+            "play my library"
+          ]
+        },
+        {
+          "name": "AMAZON.PauseIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.ResumeIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.NextIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.PreviousIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.StopIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.CancelIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.HelpIntent",
+          "samples": []
+        }
+      ],
+      "types": []
+    }
+  }
+}
+

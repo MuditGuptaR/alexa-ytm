@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  alexa-ytm:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: alexa-ytm
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Optional: Mount browser.json for authenticated personal playlists / liked songs
+      - ./browser.json:/app/browser.json:ro
+    ports:
+      # Optional local port if routing via Cloudflare Tunnel or local proxy
+      - "127.0.0.1:8000:8000"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.alexa-ytm.rule=Host(`${DOMAIN}`)"
+      - "traefik.http.routers.alexa-ytm.entrypoints=websecure"
+      - "traefik.http.routers.alexa-ytm.tls=true"
+      - "traefik.http.routers.alexa-ytm.tls.certresolver=${TRAEFIK_CERT_RESOLVER:-letsencrypt}"
+      - "traefik.http.services.alexa-ytm.loadbalancer.server.port=8000"
+    networks:
+      - traefik_net
+
+networks:
+  traefik_net:
+    external: true
+    name: ${TRAEFIK_NETWORK:-traefik_default}
+
