@@ -42,9 +42,12 @@ YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "").strip()
 
 if YOUTUBE_COOKIES:
     try:
+        clean_cookies = YOUTUBE_COOKIES.strip()
+        if (clean_cookies.startswith('"') and clean_cookies.endswith('"')) or (clean_cookies.startswith("'") and clean_cookies.endswith("'")):
+            clean_cookies = clean_cookies[1:-1]
         with open(COOKIE_FILE, "w", encoding="utf-8") as f:
-            f.write(YOUTUBE_COOKIES)
-        logger.info(f"Loaded YouTube authentication cookies into {COOKIE_FILE}")
+            f.write(clean_cookies + "\n")
+        logger.info(f"Loaded YouTube authentication cookies into {COOKIE_FILE} ({len(clean_cookies)} bytes)")
     except Exception as e:
         logger.error(f"Failed to write YOUTUBE_COOKIES to {COOKIE_FILE}: {e}")
 
@@ -550,20 +553,34 @@ async def proxy_audio_stream(video_id: str, t: str, exp: str, request: Request):
 
     # 2. Fallback to yt-dlp if direct URL was not available
     if not audio_url:
-        ydl_opts = {
-            "format": "140/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best",
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "extractor_args": {
-                "youtube": {
-                    "player_client": ["android", "ios", "mweb"]
-                }
-            },
-        }
-        if os.path.exists(COOKIE_FILE):
-            ydl_opts["cookiefile"] = COOKIE_FILE
-            logger.info(f"Using cookiefile {COOKIE_FILE} for yt-dlp stream extraction")
+        has_cookies = os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 50
+        if has_cookies:
+            ydl_opts = {
+                "format": "140/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best",
+                "quiet": True,
+                "no_warnings": True,
+                "noplaylist": True,
+                "cookiefile": COOKIE_FILE,
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": ["tv", "web", "mweb"]
+                    }
+                },
+            }
+            logger.info(f"Using cookiefile {COOKIE_FILE} with [tv, web, mweb] client for stream extraction")
+        else:
+            ydl_opts = {
+                "format": "140/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best",
+                "quiet": True,
+                "no_warnings": True,
+                "noplaylist": True,
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": ["tv_embedded", "tv", "android", "mweb"]
+                    }
+                },
+            }
+            logger.info("No cookies found: using [tv_embedded, tv, android] client for stream extraction")
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
