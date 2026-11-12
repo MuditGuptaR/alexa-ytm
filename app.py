@@ -253,6 +253,8 @@ def get_radio_next(video_id: str):
     return None
 
 
+import traceback
+
 @app.post("/alexa")
 async def alexa_skill_handler(request: Request):
     domain = resolve_domain(request)
@@ -462,6 +464,15 @@ async def alexa_skill_handler(request: Request):
 
     # Default empty 200 response for lifecycle events (PlaybackStarted, PlaybackStopped, PlaybackFinished, SessionEndedRequest)
     return {"version": "1.0", "response": {}}
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    if isinstance(exc, HTTPException):
+        return Response(content=exc.detail, status_code=exc.status_code, media_type="text/plain")
+    err_msg = traceback.format_exc()
+    logger.error(f"Unhandled exception on {request.url.path}:\n{err_msg}")
+    return Response(content=f"Error: {err_msg}", status_code=500, media_type="text/plain")
 
 
 @app.get("/stream/{video_id}")
