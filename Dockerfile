@@ -10,14 +10,17 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+# Cached layer: only installs ffmpeg (curl removed; not needed by Python)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg curl && \
-    rm -rf /var/lib/apt/lists/*
+    apt-get install -y --no-install-recommends ffmpeg && \
+    rm -rf /var/lib/apt/lists/* && \
+    useradd -u 1000 -m appuser
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
+USER appuser
 
 EXPOSE 5000
 

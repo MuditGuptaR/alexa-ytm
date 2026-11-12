@@ -275,7 +275,7 @@ async def alexa_skill_handler(request: Request):
     # Validate Skill ID if set
     if ALEXA_SKILL_ID:
         clean_skill_id = ALEXA_SKILL_ID.strip()
-        if app_id and app_id.strip() != clean_skill_id:
+        if not app_id or app_id.strip() != clean_skill_id:
             logger.warning(f"Skill ID mismatch: got '{app_id}', expected '{clean_skill_id}'")
             raise HTTPException(status_code=403, detail="Skill ID mismatch")
 
@@ -467,6 +467,9 @@ async def alexa_skill_handler(request: Request):
 @app.get("/stream/{video_id}")
 async def proxy_audio_stream(video_id: str, t: str, exp: str, request: Request):
     """Securely proxies YouTube audio stream directly to Alexa with range support."""
+    if not re.fullmatch(r"^[a-zA-Z0-9_-]{11}$", video_id):
+        raise HTTPException(status_code=400, detail="Invalid video ID format")
+
     if not verify_stream_token(video_id, t, exp):
         raise HTTPException(status_code=403, detail="Forbidden: Invalid or expired audio token")
 
