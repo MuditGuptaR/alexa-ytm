@@ -40,8 +40,6 @@ COOKIE_FILE = os.getenv("COOKIE_FILE", "/tmp/cookies.txt")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "").strip()
 YTDLP_CACHE_DIR = "/tmp/yt-dlp-cache"
-# If user provides a pre-generated OAuth token JSON, write it to the cache dir at startup
-YTDLP_OAUTH_TOKEN = os.getenv("YTDLP_OAUTH_TOKEN", "").strip()
 
 
 def format_netscape_cookies(raw_cookies: str) -> str:
@@ -69,32 +67,7 @@ if YOUTUBE_COOKIES:
         logger.error(f"Failed to write YOUTUBE_COOKIES to {COOKIE_FILE}: {e}")
 
 
-# Set up yt-dlp OAuth2 token cache directory
 os.makedirs(YTDLP_CACHE_DIR, exist_ok=True)
-
-if YTDLP_OAUTH_TOKEN:
-    # Write the OAuth token to the yt-dlp cache dir so it's picked up automatically
-    # yt-dlp stores YouTube OAuth tokens at: <cache_dir>/youtube-oauth2.token
-    oauth_token_path = os.path.join(YTDLP_CACHE_DIR, "youtube-oauth2.token")
-    try:
-        # Accept either raw JSON or base64-encoded JSON
-        token_data = YTDLP_OAUTH_TOKEN
-        try:
-            # Try to parse as JSON directly
-            json.loads(token_data)
-        except json.JSONDecodeError:
-            # Try base64 decode
-            try:
-                token_data = base64.b64decode(YTDLP_OAUTH_TOKEN).decode("utf-8")
-                json.loads(token_data)  # Validate it's valid JSON
-            except Exception:
-                token_data = YTDLP_OAUTH_TOKEN  # Use as-is
-
-        with open(oauth_token_path, "w", encoding="utf-8") as f:
-            f.write(token_data)
-        logger.info(f"Wrote yt-dlp OAuth2 token to {oauth_token_path}")
-    except Exception as e:
-        logger.error(f"Failed to write YTDLP_OAUTH_TOKEN: {e}")
 
 
 def resolve_domain(request: Request) -> str:
@@ -342,8 +315,8 @@ def get_radio_next(video_id: str):
     return None
 
 
-def _build_ydl_opts(use_oauth: bool) -> dict:
-    """Build yt-dlp options. OAuth2 takes priority; cookies are fallback."""
+def _build_ydl_opts() -> dict:
+    """Build yt-dlp options with best datacenter-compatible clients."""
     opts = {
         "format": "140/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best",
         "quiet": True,
@@ -353,35 +326,25 @@ def _build_ydl_opts(use_oauth: bool) -> dict:
         "socket_timeout": 15,
     }
 
-    if use_oauth:
-        # Use yt-dlp's built-in OAuth2 (token stored in cache_dir)
-        opts["username"] = "oauth2"
-        opts["password"] = ""
-        opts["cache_dir"] = YTDLP_CACHE_DIR
-        # Use web client with oauth - most compatible
+    has_cookies = os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 50
+    if has_cookies:
+        opts["cookiefile"] = COOKIE_FILE
+        # ios + web_music: best combination for datacenter IPs with cookies
+        # ios client returns unsigned URLs (no signatureCipher), less bot-flagged
         opts["extractor_args"] = {
             "youtube": {
-                "player_client": ["web", "mweb"]
+                "player_client": ["ios", "web_music", "tv_embedded"]
             }
         }
-        logger.info("Using yt-dlp OAuth2 authentication for stream extraction")
+        logger.info(f"yt-dlp: cookies + [ios, web_music, tv_embedded] clients")
     else:
-        has_cookies = os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 50
-        if has_cookies:
-            opts["cookiefile"] = COOKIE_FILE
-            opts["extractor_args"] = {
-                "youtube": {
-                    "player_client": ["web", "mweb", "tv"]
-                }
+        # Without cookies: ios_music and tv_embedded are least restricted on datacenter IPs
+        opts["extractor_args"] = {
+            "youtube": {
+                "player_client": ["ios", "tv_embedded", "web_music"]
             }
-            logger.info(f"Using cookiefile {COOKIE_FILE} with [web, mweb, tv] client for stream extraction")
-        else:
-            opts["extractor_args"] = {
-                "youtube": {
-                    "player_client": ["tv_embedded", "tv", "android", "mweb"]
-                }
-            }
-            logger.info("No auth: using [tv_embedded, tv, android, mweb] client for stream extraction")
+        }
+        logger.info("yt-dlp: no cookies, using [ios, tv_embedded, web_music] clients")
 
     return opts
 
@@ -643,17 +606,13 @@ async def proxy_audio_stream(video_id: str, t: str, exp: str, request: Request):
 
     # 2. Fallback to yt-dlp
     if not audio_url:
-        # Determine if OAuth2 token is available
-        oauth_token_path = os.path.join(YTDLP_CACHE_DIR, "youtube-oauth2.token")
-        has_oauth = os.path.exists(oauth_token_path)
-
-        ydl_opts = _build_ydl_opts(use_oauth=has_oauth)
+        ydl_opts = _build_ydl_opts()
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
                 audio_url = info.get("url")
                 if audio_url:
-                    logger.info(f"yt-dlp resolved stream for {video_id} (oauth={has_oauth})")
+                    logger.info(f"yt-dlp resolved stream for {video_id}")
         except Exception as e:
             logger.error(f"yt-dlp resolution error for {video_id}: {traceback.format_exc()}")
 
@@ -694,20 +653,11 @@ async def proxy_audio_stream(video_id: str, t: str, exp: str, request: Request):
     )
 
 
-@app.get("/oauth/status")
-async def oauth_status():
-    """Check if yt-dlp OAuth2 token is configured."""
-    oauth_token_path = os.path.join(YTDLP_CACHE_DIR, "youtube-oauth2.token")
-    has_oauth = os.path.exists(oauth_token_path)
-    has_cookies = os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 50
-    return {
-        "oauth2_token": has_oauth,
-        "cookies": has_cookies,
-        "cache_dir": YTDLP_CACHE_DIR,
-        "token_path": oauth_token_path if has_oauth else None,
-    }
-
-
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "service": "alexa-ytm"}
+    oauth_token_path = os.path.join(YTDLP_CACHE_DIR, "youtube-oauth2.token")
+    return {
+        "status": "ok",
+        "service": "alexa-ytm",
+        "cookies": os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 50,
+    }
