@@ -4,6 +4,8 @@ import secrets
 import re
 import hmac
 import hashlib
+import json
+import traceback
 from urllib.parse import quote
 import logging
 from typing import Optional, Dict, Any
@@ -12,7 +14,7 @@ import base64
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException, Response, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from dotenv import load_dotenv
 from ytmusicapi import YTMusic
 import yt_dlp
@@ -25,20 +27,22 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("alexa-ytm")
 
-# Environment variables with smart auto-detection
+# Environment variables
 DOMAIN = os.getenv("DOMAIN", "").strip()
 STREAM_SECRET = os.getenv("STREAM_SECRET", "").strip()
 if not STREAM_SECRET:
     STREAM_SECRET = secrets.token_hex(16)
     logger.info("STREAM_SECRET was empty: automatically generated a secure random 32-char secret.")
 
-# Default to the user's Skill ID; strictly reject all other callers
 ALEXA_SKILL_ID = os.getenv("ALEXA_SKILL_ID", "amzn1.ask.skill.7848da1c-e2dc-4113-889d-01eb5cb61b51").strip()
-# Behind Cloudflare Tunnel, Skill ID authorization is standard and prevents signature breakage
 VERIFY_ALEXA_SIGNATURE = os.getenv("VERIFY_ALEXA_SIGNATURE", "false").lower() == "true"
 COOKIE_FILE = os.getenv("COOKIE_FILE", "/tmp/cookies.txt")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "").strip()
+YTDLP_CACHE_DIR = "/tmp/yt-dlp-cache"
+# If user provides a pre-generated OAuth token JSON, write it to the cache dir at startup
+YTDLP_OAUTH_TOKEN = os.getenv("YTDLP_OAUTH_TOKEN", "").strip()
+
 
 def format_netscape_cookies(raw_cookies: str) -> str:
     """Ensures flattened/single-line environment variable cookies are properly formatted for Netscape format."""
@@ -53,6 +57,7 @@ def format_netscape_cookies(raw_cookies: str) -> str:
         lines.insert(0, header)
     return "\n".join(lines) + "\n"
 
+
 if YOUTUBE_COOKIES:
     try:
         clean_cookies = format_netscape_cookies(YOUTUBE_COOKIES.strip())
@@ -62,6 +67,35 @@ if YOUTUBE_COOKIES:
         logger.info(f"Loaded {cookie_count} YouTube authentication cookies into {COOKIE_FILE}")
     except Exception as e:
         logger.error(f"Failed to write YOUTUBE_COOKIES to {COOKIE_FILE}: {e}")
+
+
+# Set up yt-dlp OAuth2 token cache directory
+os.makedirs(YTDLP_CACHE_DIR, exist_ok=True)
+
+if YTDLP_OAUTH_TOKEN:
+    # Write the OAuth token to the yt-dlp cache dir so it's picked up automatically
+    # yt-dlp stores YouTube OAuth tokens at: <cache_dir>/youtube-oauth2.token
+    oauth_token_path = os.path.join(YTDLP_CACHE_DIR, "youtube-oauth2.token")
+    try:
+        # Accept either raw JSON or base64-encoded JSON
+        token_data = YTDLP_OAUTH_TOKEN
+        try:
+            # Try to parse as JSON directly
+            json.loads(token_data)
+        except json.JSONDecodeError:
+            # Try base64 decode
+            try:
+                token_data = base64.b64decode(YTDLP_OAUTH_TOKEN).decode("utf-8")
+                json.loads(token_data)  # Validate it's valid JSON
+            except Exception:
+                token_data = YTDLP_OAUTH_TOKEN  # Use as-is
+
+        with open(oauth_token_path, "w", encoding="utf-8") as f:
+            f.write(token_data)
+        logger.info(f"Wrote yt-dlp OAuth2 token to {oauth_token_path}")
+    except Exception as e:
+        logger.error(f"Failed to write YTDLP_OAUTH_TOKEN: {e}")
+
 
 def resolve_domain(request: Request) -> str:
     """Uses configured DOMAIN or auto-detects from request headers."""
@@ -74,6 +108,7 @@ def resolve_domain(request: Request) -> str:
     if host:
         return host.strip()
     return "localhost"
+
 
 # Initialize YTMusic
 yt = None
@@ -92,6 +127,9 @@ app = FastAPI(title="Alexa YouTube Music Bridge", docs_url=None, redoc_url=None)
 
 # Cache for Amazon certs
 CERT_CACHE: Dict[str, x509.Certificate] = {}
+
+# In-memory store for ongoing OAuth flows: { state_id: { "proc": ..., "url": ..., "code": ... } }
+OAUTH_FLOWS: Dict[str, Any] = {}
 
 
 def generate_stream_token(video_id: str, duration_sec: int = 14400) -> Dict[str, str]:
@@ -273,9 +311,8 @@ def search_track(query: str):
     results = yt.search(clean_q, filter="songs")
     if not results:
         results = yt.search(clean_q)
-    
+
     for r in results:
-        # Look for a playable item with a videoId
         vid = r.get("videoId")
         if vid:
             title = r.get("title", "Unknown Track")
@@ -305,8 +342,49 @@ def get_radio_next(video_id: str):
     return None
 
 
-import json
-import traceback
+def _build_ydl_opts(use_oauth: bool) -> dict:
+    """Build yt-dlp options. OAuth2 takes priority; cookies are fallback."""
+    opts = {
+        "format": "140/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best",
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "force_ipv4": True,
+        "socket_timeout": 15,
+    }
+
+    if use_oauth:
+        # Use yt-dlp's built-in OAuth2 (token stored in cache_dir)
+        opts["username"] = "oauth2"
+        opts["password"] = ""
+        opts["cache_dir"] = YTDLP_CACHE_DIR
+        # Use web client with oauth - most compatible
+        opts["extractor_args"] = {
+            "youtube": {
+                "player_client": ["web", "mweb"]
+            }
+        }
+        logger.info("Using yt-dlp OAuth2 authentication for stream extraction")
+    else:
+        has_cookies = os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 50
+        if has_cookies:
+            opts["cookiefile"] = COOKIE_FILE
+            opts["extractor_args"] = {
+                "youtube": {
+                    "player_client": ["web", "mweb", "tv"]
+                }
+            }
+            logger.info(f"Using cookiefile {COOKIE_FILE} with [web, mweb, tv] client for stream extraction")
+        else:
+            opts["extractor_args"] = {
+                "youtube": {
+                    "player_client": ["tv_embedded", "tv", "android", "mweb"]
+                }
+            }
+            logger.info("No auth: using [tv_embedded, tv, android, mweb] client for stream extraction")
+
+    return opts
+
 
 @app.post("/alexa")
 async def alexa_skill_handler(request: Request):
@@ -519,7 +597,7 @@ async def alexa_skill_handler(request: Request):
                     }
                 }
 
-    # Default empty 200 response for lifecycle events (PlaybackStarted, PlaybackStopped, PlaybackFinished, SessionEndedRequest)
+    # Default empty 200 response for lifecycle events
     return {"version": "1.0", "response": {}}
 
 
@@ -563,41 +641,19 @@ async def proxy_audio_stream(video_id: str, t: str, exp: str, request: Request):
     except Exception as e:
         logger.warning(f"ytmusicapi get_song failed for {video_id}: {e}")
 
-    # 2. Fallback to yt-dlp if direct URL was not available
+    # 2. Fallback to yt-dlp
     if not audio_url:
-        has_cookies = os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 50
-        if has_cookies:
-            ydl_opts = {
-                "format": "140/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best",
-                "quiet": True,
-                "no_warnings": True,
-                "noplaylist": True,
-                "cookiefile": COOKIE_FILE,
-                "extractor_args": {
-                    "youtube": {
-                        "player_client": ["web", "mweb", "tv"]
-                    }
-                },
-            }
-            logger.info(f"Using cookiefile {COOKIE_FILE} with [web, mweb, tv] client for stream extraction")
-        else:
-            ydl_opts = {
-                "format": "140/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best",
-                "quiet": True,
-                "no_warnings": True,
-                "noplaylist": True,
-                "extractor_args": {
-                    "youtube": {
-                        "player_client": ["tv_embedded", "tv", "android", "mweb"]
-                    }
-                },
-            }
-            logger.info("No cookies found: using [tv_embedded, tv, android] client for stream extraction")
+        # Determine if OAuth2 token is available
+        oauth_token_path = os.path.join(YTDLP_CACHE_DIR, "youtube-oauth2.token")
+        has_oauth = os.path.exists(oauth_token_path)
 
+        ydl_opts = _build_ydl_opts(use_oauth=has_oauth)
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
                 audio_url = info.get("url")
+                if audio_url:
+                    logger.info(f"yt-dlp resolved stream for {video_id} (oauth={has_oauth})")
         except Exception as e:
             logger.error(f"yt-dlp resolution error for {video_id}: {traceback.format_exc()}")
 
@@ -638,7 +694,20 @@ async def proxy_audio_stream(video_id: str, t: str, exp: str, request: Request):
     )
 
 
+@app.get("/oauth/status")
+async def oauth_status():
+    """Check if yt-dlp OAuth2 token is configured."""
+    oauth_token_path = os.path.join(YTDLP_CACHE_DIR, "youtube-oauth2.token")
+    has_oauth = os.path.exists(oauth_token_path)
+    has_cookies = os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 50
+    return {
+        "oauth2_token": has_oauth,
+        "cookies": has_cookies,
+        "cache_dir": YTDLP_CACHE_DIR,
+        "token_path": oauth_token_path if has_oauth else None,
+    }
+
+
 @app.get("/health")
 def health_check():
     return {"status": "ok", "service": "alexa-ytm"}
-
