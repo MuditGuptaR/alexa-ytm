@@ -91,22 +91,26 @@ async def verify_alexa_request(request: Request, raw_body: bytes) -> bool:
     if not VERIFY_ALEXA_SIGNATURE:
         return True
 
-    cert_url = request.headers.get("SignatureCertChainUrl", "")
-    signature = request.headers.get("Signature", "")
+    cert_url = request.headers.get("SignatureCertChainUrl") or request.headers.get("signaturecertchainurl", "")
+    signature = request.headers.get("Signature") or request.headers.get("signature", "")
 
     if not cert_url or not signature:
-        logger.warning("Missing Alexa signature headers")
+        logger.warning("Missing Alexa signature headers (SignatureCertChainUrl or Signature)")
         return False
 
     # Validate cert URL
     parsed_url = urlparse(cert_url)
     if parsed_url.scheme.lower() != "https":
+        logger.warning(f"Invalid cert URL scheme: {parsed_url.scheme}")
         return False
     if parsed_url.hostname.lower() != "s3.amazonaws.com":
+        logger.warning(f"Invalid cert hostname: {parsed_url.hostname}")
         return False
     if not parsed_url.path.startswith("/echo.api/"):
+        logger.warning(f"Invalid cert path: {parsed_url.path}")
         return False
     if parsed_url.port and parsed_url.port != 443:
+        logger.warning(f"Invalid cert port: {parsed_url.port}")
         return False
 
     try:
@@ -117,30 +121,43 @@ async def verify_alexa_request(request: Request, raw_body: bytes) -> bool:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 res = await client.get(cert_url)
                 if res.status_code != 200:
+                    logger.warning(f"Failed to fetch cert from Amazon: status {res.status_code}")
                     return False
                 cert = x509.load_pem_x509_certificate(res.content)
                 CERT_CACHE[cert_url] = cert
 
         # Verify cert validity period
         now = time.time()
-        if now < cert.not_valid_before.timestamp() or now > cert.not_valid_after.timestamp():
+        nvb = getattr(cert, "not_valid_before_utc", cert.not_valid_before).timestamp()
+        nva = getattr(cert, "not_valid_after_utc", cert.not_valid_after).timestamp()
+        if now < nvb or now > nva:
+            logger.warning("Amazon certificate expired or not yet active")
             return False
 
         # Verify Subject Alternative Name contains echo.api.amazon.com
         san_ext = cert.extensions.get_extension_for_oid(x509.oid.ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
         dns_names = san_ext.value.get_values_for_type(x509.DNSName)
         if "echo.api.amazon.com" not in dns_names:
+            logger.warning("SAN does not contain echo.api.amazon.com")
             return False
 
-        # Verify signature
+        # Verify signature (Amazon uses SHA256withRSA, with SHA1 fallback)
         public_key = cert.public_key()
         sig_bytes = base64.b64decode(signature)
-        public_key.verify(
-            sig_bytes,
-            raw_body,
-            padding.PKCS1v15(),
-            hashes.SHA1()
-        )
+        try:
+            public_key.verify(
+                sig_bytes,
+                raw_body,
+                padding.PKCS1v15(),
+                hashes.SHA256()
+            )
+        except Exception:
+            public_key.verify(
+                sig_bytes,
+                raw_body,
+                padding.PKCS1v15(),
+                hashes.SHA1()
+            )
         return True
     except Exception as e:
         logger.warning(f"Signature verification failed: {e}")
@@ -221,17 +238,21 @@ async def alexa_skill_handler(request: Request):
 
     data = await request.json()
 
-    # Validate Skill ID if set
     app_id = (
         data.get("session", {}).get("application", {}).get("applicationId")
         or data.get("context", {}).get("System", {}).get("application", {}).get("applicationId")
     )
-    if ALEXA_SKILL_ID and app_id != ALEXA_SKILL_ID:
-        logger.warning(f"Skill ID mismatch: got '{app_id}', expected '{ALEXA_SKILL_ID}'")
-        raise HTTPException(status_code=403, detail="Skill ID mismatch")
-
     req = data.get("request", {})
-    req_type = req.get("type")
+    req_type = req.get("type", "Unknown")
+    intent_name = req.get("intent", {}).get("name", "N/A") if req_type == "IntentRequest" else "N/A"
+    logger.info(f"Incoming Alexa request: {req_type} (Intent: {intent_name}, AppId: {app_id})")
+
+    # Validate Skill ID if set
+    if ALEXA_SKILL_ID:
+        clean_skill_id = ALEXA_SKILL_ID.strip()
+        if app_id and app_id.strip() != clean_skill_id:
+            logger.warning(f"Skill ID mismatch: got '{app_id}', expected '{clean_skill_id}'")
+            raise HTTPException(status_code=403, detail="Skill ID mismatch")
 
     # 1. LaunchRequest
     if req_type == "LaunchRequest":
