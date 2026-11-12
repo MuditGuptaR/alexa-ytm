@@ -40,14 +40,26 @@ COOKIE_FILE = os.getenv("COOKIE_FILE", "/tmp/cookies.txt")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "").strip()
 
+def format_netscape_cookies(raw_cookies: str) -> str:
+    """Ensures flattened/single-line environment variable cookies are properly formatted for Netscape format."""
+    content = raw_cookies.replace("\\n", "\n").replace("\\t", "\t")
+    if (content.startswith('"') and content.endswith('"')) or (content.startswith("'") and content.endswith("'")):
+        content = content[1:-1]
+    # Insert newlines before each cookie domain if flattened into a single line
+    content = re.sub(r'([^\n])\s+(\.?youtube\.com|\.?google\.com|#HttpOnly_)', r'\1\n\2', content)
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    header = "# Netscape HTTP Cookie File"
+    if not lines or header not in lines[0]:
+        lines.insert(0, header)
+    return "\n".join(lines) + "\n"
+
 if YOUTUBE_COOKIES:
     try:
-        clean_cookies = YOUTUBE_COOKIES.strip()
-        if (clean_cookies.startswith('"') and clean_cookies.endswith('"')) or (clean_cookies.startswith("'") and clean_cookies.endswith("'")):
-            clean_cookies = clean_cookies[1:-1]
+        clean_cookies = format_netscape_cookies(YOUTUBE_COOKIES.strip())
         with open(COOKIE_FILE, "w", encoding="utf-8") as f:
-            f.write(clean_cookies + "\n")
-        logger.info(f"Loaded YouTube authentication cookies into {COOKIE_FILE} ({len(clean_cookies)} bytes)")
+            f.write(clean_cookies)
+        cookie_count = len([l for l in clean_cookies.splitlines() if not l.startswith("#") and l.strip()])
+        logger.info(f"Loaded {cookie_count} YouTube authentication cookies into {COOKIE_FILE}")
     except Exception as e:
         logger.error(f"Failed to write YOUTUBE_COOKIES to {COOKIE_FILE}: {e}")
 
@@ -563,11 +575,11 @@ async def proxy_audio_stream(video_id: str, t: str, exp: str, request: Request):
                 "cookiefile": COOKIE_FILE,
                 "extractor_args": {
                     "youtube": {
-                        "player_client": ["tv", "web", "mweb"]
+                        "player_client": ["web", "mweb", "tv"]
                     }
                 },
             }
-            logger.info(f"Using cookiefile {COOKIE_FILE} with [tv, web, mweb] client for stream extraction")
+            logger.info(f"Using cookiefile {COOKIE_FILE} with [web, mweb, tv] client for stream extraction")
         else:
             ydl_opts = {
                 "format": "140/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best",
