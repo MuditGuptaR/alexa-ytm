@@ -253,6 +253,7 @@ def get_radio_next(video_id: str):
     return None
 
 
+import json
 import traceback
 
 @app.post("/alexa")
@@ -263,7 +264,11 @@ async def alexa_skill_handler(request: Request):
     if not await verify_alexa_request(request, raw_body):
         raise HTTPException(status_code=400, detail="Invalid request signature")
 
-    data = await request.json()
+    try:
+        data = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+    except Exception as e:
+        logger.warning(f"Failed to decode JSON body: {e}")
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
 
     app_id = (
         data.get("session", {}).get("application", {}).get("applicationId")
@@ -484,12 +489,17 @@ async def proxy_audio_stream(video_id: str, t: str, exp: str, request: Request):
     if not verify_stream_token(video_id, t, exp):
         raise HTTPException(status_code=403, detail="Forbidden: Invalid or expired audio token")
 
-    # Extract direct audio URL via yt-dlp
+    # Extract direct audio URL via yt-dlp using Android/iOS client to bypass datacenter IP restrictions
     ydl_opts = {
         "format": "140/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best",
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "ios", "mweb"]
+            }
+        },
     }
 
     try:
@@ -499,8 +509,8 @@ async def proxy_audio_stream(video_id: str, t: str, exp: str, request: Request):
             if not audio_url:
                 raise HTTPException(status_code=404, detail="Audio stream not found")
     except Exception as e:
-        logger.error(f"yt-dlp resolution error for {video_id}: {e}")
-        raise HTTPException(status_code=502, detail="Failed to resolve audio stream")
+        logger.error(f"yt-dlp resolution error for {video_id}: {traceback.format_exc()}")
+        raise HTTPException(status_code=502, detail=f"Failed to resolve audio stream: {e}")
 
     # Forward range header from Alexa
     client = httpx.AsyncClient(follow_redirects=True, timeout=30.0)
