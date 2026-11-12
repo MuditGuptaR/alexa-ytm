@@ -16,12 +16,13 @@ WORKDIR /app
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ffmpeg && \
     rm -rf /var/lib/apt/lists/* && \
-    useradd -u 1000 -m appuser
+    useradd -u 1000 -m appuser && \
+    chown -R appuser:appuser /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py .
+COPY --chown=appuser:appuser app.py .
 USER appuser
 
 EXPOSE 5000

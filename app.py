@@ -36,7 +36,7 @@ if not STREAM_SECRET:
 ALEXA_SKILL_ID = os.getenv("ALEXA_SKILL_ID", "amzn1.ask.skill.7848da1c-e2dc-4113-889d-01eb5cb61b51").strip()
 # Behind Cloudflare Tunnel, Skill ID authorization is standard and prevents signature breakage
 VERIFY_ALEXA_SIGNATURE = os.getenv("VERIFY_ALEXA_SIGNATURE", "false").lower() == "true"
-COOKIE_FILE = os.getenv("COOKIE_FILE", "cookies.txt")
+COOKIE_FILE = os.getenv("COOKIE_FILE", "/tmp/cookies.txt")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "").strip()
 
@@ -61,10 +61,15 @@ def resolve_domain(request: Request) -> str:
     return "localhost"
 
 # Initialize YTMusic
-if os.path.exists(COOKIE_FILE):
-    logger.info(f"Loading authenticated YouTube Music session from {COOKIE_FILE}")
-    yt = YTMusic(COOKIE_FILE)
-else:
+yt = None
+if os.path.exists(COOKIE_FILE) and COOKIE_FILE.endswith(".json"):
+    try:
+        logger.info(f"Loading authenticated YouTube Music session from {COOKIE_FILE}")
+        yt = YTMusic(COOKIE_FILE)
+    except Exception as e:
+        logger.warning(f"Could not load {COOKIE_FILE} into YTMusic: {e}")
+
+if yt is None:
     logger.info("Initializing public/unauthenticated YouTube Music client")
     yt = YTMusic()
 
