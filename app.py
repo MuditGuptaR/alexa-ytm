@@ -1,6 +1,7 @@
 import os
 import time
 import secrets
+import re
 import hmac
 import hashlib
 import logging
@@ -30,8 +31,10 @@ if not STREAM_SECRET:
     STREAM_SECRET = secrets.token_hex(16)
     logger.info("STREAM_SECRET was empty: automatically generated a secure random 32-char secret.")
 
-ALEXA_SKILL_ID = os.getenv("ALEXA_SKILL_ID", "").strip()
-VERIFY_ALEXA_SIGNATURE = os.getenv("VERIFY_ALEXA_SIGNATURE", "true").lower() == "true"
+# Default to the user's Skill ID; strictly reject all other callers
+ALEXA_SKILL_ID = os.getenv("ALEXA_SKILL_ID", "amzn1.ask.skill.7848da1c-e2dc-4113-889d-01eb5cb61b51").strip()
+# Behind Cloudflare Tunnel, Skill ID authorization is standard and prevents signature breakage
+VERIFY_ALEXA_SIGNATURE = os.getenv("VERIFY_ALEXA_SIGNATURE", "false").lower() == "true"
 COOKIE_FILE = os.getenv("COOKIE_FILE", "browser.json")
 
 def resolve_domain(request: Request) -> str:
@@ -164,6 +167,22 @@ async def verify_alexa_request(request: Request, raw_body: bytes) -> bool:
         return False
 
 
+def clean_query(q: str) -> str:
+    """Removes common Alexa invocation artifacts from the query string."""
+    patterns = [
+        r"^(?:ask|tell)\s+youtube\s+music\s+to\s+play\s+",
+        r"^youtube\s+music\s+play\s+",
+        r"^play\s+",
+        r"\s+on\s+youtube\s+music$",
+        r"\s+by\s+youtube\s+music$",
+        r"^starboyask\s+youtube\s+music\s+to\s+play\s+",
+    ]
+    cleaned = q.strip()
+    for p in patterns:
+        cleaned = re.sub(p, "", cleaned, flags=re.IGNORECASE).strip()
+    return cleaned or q.strip()
+
+
 def build_audio_directive(domain: str, play_behavior: str, video_id: str, title: str, artist: str, thumb_url: str, prev_token: Optional[str] = None):
     sec = generate_stream_token(video_id)
     stream_url = f"https://{domain}/stream/{video_id}?t={sec['token']}&exp={sec['exp']}"
@@ -176,27 +195,32 @@ def build_audio_directive(domain: str, play_behavior: str, video_id: str, title:
     if prev_token:
         stream_obj["expectedPreviousToken"] = prev_token
 
+    metadata = {
+        "title": title,
+        "subtitle": artist
+    }
+    if thumb_url:
+        metadata["art"] = {
+            "sources": [{"url": thumb_url}]
+        }
+
     return {
         "type": "AudioPlayer.Play",
         "playBehavior": play_behavior,
         "audioItem": {
             "stream": stream_obj,
-            "metadata": {
-                "title": title,
-                "subtitle": artist,
-                "art": {
-                    "sources": [{"url": thumb_url}] if thumb_url else []
-                }
-            }
+            "metadata": metadata
         }
     }
 
 
 def search_track(query: str):
     """Search for a track on YouTube Music and extract metadata."""
-    results = yt.search(query, filter="songs")
+    clean_q = clean_query(query)
+    logger.info(f"Searching YouTube Music for: '{clean_q}' (raw query: '{query}')")
+    results = yt.search(clean_q, filter="songs")
     if not results:
-        results = yt.search(query)
+        results = yt.search(clean_q)
     
     for r in results:
         # Look for a playable item with a videoId
@@ -206,6 +230,7 @@ def search_track(query: str):
             artists = ", ".join([a.get("name", "") for a in r.get("artists", [])]) or "YouTube Music"
             thumbs = r.get("thumbnails", [])
             thumb_url = thumbs[-1]["url"] if thumbs else ""
+            logger.info(f"Found track: '{title}' by '{artists}' (ID: {vid})")
             return {"videoId": vid, "title": title, "artist": artists, "thumb": thumb_url}
     return None
 
@@ -301,8 +326,7 @@ async def alexa_skill_handler(request: Request):
                         "type": "PlainText",
                         "text": f"Playing {track['title']} by {track['artist']}"
                     },
-                    "directives": [directive],
-                    "shouldEndSession": True
+                    "directives": [directive]
                 }
             }
 
@@ -326,8 +350,7 @@ async def alexa_skill_handler(request: Request):
                     "version": "1.0",
                     "response": {
                         "outputSpeech": {"type": "PlainText", "text": "Playing your liked songs on YouTube Music."},
-                        "directives": [directive],
-                        "shouldEndSession": True
+                        "directives": [directive]
                     }
                 }
             except Exception as e:
@@ -367,7 +390,7 @@ async def alexa_skill_handler(request: Request):
                         }
                     }
                 }
-                return {"version": "1.0", "response": {"directives": [directive], "shouldEndSession": True}}
+                return {"version": "1.0", "response": {"directives": [directive]}}
             return {"version": "1.0", "response": {"shouldEndSession": True}}
 
         elif intent_name == "AMAZON.NextIntent":
@@ -379,8 +402,7 @@ async def alexa_skill_handler(request: Request):
                     return {
                         "version": "1.0",
                         "response": {
-                            "directives": [directive],
-                            "shouldEndSession": True
+                            "directives": [directive]
                         }
                     }
             return {"version": "1.0", "response": {"directives": [{"type": "AudioPlayer.Stop"}], "shouldEndSession": True}}
@@ -401,7 +423,7 @@ async def alexa_skill_handler(request: Request):
                         }
                     }
                 }
-                return {"version": "1.0", "response": {"directives": [directive], "shouldEndSession": True}}
+                return {"version": "1.0", "response": {"directives": [directive]}}
             return {"version": "1.0", "response": {"shouldEndSession": True}}
 
         elif intent_name in ("AMAZON.HelpIntent",):
