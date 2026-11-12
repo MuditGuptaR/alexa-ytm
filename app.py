@@ -36,8 +36,17 @@ if not STREAM_SECRET:
 ALEXA_SKILL_ID = os.getenv("ALEXA_SKILL_ID", "amzn1.ask.skill.7848da1c-e2dc-4113-889d-01eb5cb61b51").strip()
 # Behind Cloudflare Tunnel, Skill ID authorization is standard and prevents signature breakage
 VERIFY_ALEXA_SIGNATURE = os.getenv("VERIFY_ALEXA_SIGNATURE", "false").lower() == "true"
-COOKIE_FILE = os.getenv("COOKIE_FILE", "browser.json")
+COOKIE_FILE = os.getenv("COOKIE_FILE", "cookies.txt")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
+YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "").strip()
+
+if YOUTUBE_COOKIES:
+    try:
+        with open(COOKIE_FILE, "w", encoding="utf-8") as f:
+            f.write(YOUTUBE_COOKIES)
+        logger.info(f"Loaded YouTube authentication cookies into {COOKIE_FILE}")
+    except Exception as e:
+        logger.error(f"Failed to write YOUTUBE_COOKIES to {COOKIE_FILE}: {e}")
 
 def resolve_domain(request: Request) -> str:
     """Uses configured DOMAIN or auto-detects from request headers."""
@@ -547,6 +556,10 @@ async def proxy_audio_stream(video_id: str, t: str, exp: str, request: Request):
                 }
             },
         }
+        if os.path.exists(COOKIE_FILE):
+            ydl_opts["cookiefile"] = COOKIE_FILE
+            logger.info(f"Using cookiefile {COOKIE_FILE} for yt-dlp stream extraction")
+
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
